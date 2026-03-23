@@ -1,0 +1,49 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+myvenv/
+venv/
+.venv/
+env/
+
+# Data (dev only — never commit real bookings)
+bookings.json
+*.json
+!package.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy / ruff
+.mypy_cache/
+.ruff_cache/
