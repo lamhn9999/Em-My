@@ -1,233 +1,211 @@
 """
-booking_agent.py  —  Zalo Booking Agent MVP
-============================================
-Flow:
-  User message → LLM extraction → (feedback loop for missing fields) → validate → save
-
-Feedback loop:
-  If required fields are missing, ask the user for each one interactively.
-  Natural-language date/time answers are re-parsed by the LLM.
-  The user can type 'skip' to abort the current booking at any prompt.
+booking_agent.py
+-------------
+Background daemon that polls Zalo for new messages every 10 seconds,
+processes booking intents statefully, and replies via the Zalo API.
 """
 from __future__ import annotations
 
-import dataclasses
-import sys
-from datetime import datetime
+import time
+import logging
+import os
 from pathlib import Path
+from dotenv import load_dotenv
 
-from data.backends.json_store import JsonStore
+from data.backends.sqlite import Database
 from data.models import BookingData, BookingIntent
-from validator import validate
+from services.chat_history_store import ChatHistoryStore
+from services.zalo_message_sync import ZaloMessageSync
+from services.llm_service import IntentExtractionChain
+from core.validator import BookingValidator
+from services import zalo_api as api
 
-DIV  = "─" * 58
-DIV2 = "╌" * 58
+# Clean console logging configuration
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger("BookingAgent")
 
-# ── Field metadata ─────────────────────────────────────────────────────────────
-# field → (display label, hint, needs_llm_reparse)
-FIELD_META: dict[str, tuple[str, str, bool]] = {
-    "name":    ("Tên khách hàng",  "vd: Nguyễn Lan",           False),
-    "service": ("Dịch vụ",         "vd: massage, chăm sóc da", False),
-    "date":    ("Ngày",            "vd: thứ 6 tuần này, 28/3", True),
-    "time":    ("Giờ",             "vd: 3h chiều, 15:00",      True),
-    "phone":   ("Số điện thoại",   "vd: 0912345678 (tuỳ chọn)", False),
-}
+class BookingAgent:
+    def __init__(
+        self, 
+        store: ChatHistoryStore, 
+        sync_service: ZaloMessageSync, 
+        chain: IntentExtractionChain, 
+        validator: BookingValidator
+    ):
+        self.store = store
+        self.sync = sync_service
+        self.chain = chain
+        self.validator = validator
+        self.processed_msgs = set()
 
-REQUIRED = ["name", "service", "date", "time"]
+        self._preload_processed_messages()
 
+    def _preload_processed_messages(self):
+        """Fetches recent history once on startup to avoid processing old messages."""
+        log.info("Pre-loading recent conversations to bypass historical messages...")
+        self.sync.sync_all_recent(count=10)
+        
+        params = api.build_get_list_recent_chat_params(offset=0, count=10)
+        resp = self.sync._client.get(api.Endpoint.GET_LIST_RECENT_CHAT, params=params).json()
+        
+        for convo in api.unwrap_list(resp, "list_recent_chat"):
+            parsed = api.parse_message(convo, self.sync._oa_id)
+            user_id = parsed.from_id if parsed.src == api.MessageSrc.CLIENT else parsed.to_id
+            
+            if user_id:
+                for msg in self.store.get_history(user_id, last_n=20):
+                    self.processed_msgs.add(msg.msg_id)
+                    
+        log.info(f"Ignored {len(self.processed_msgs)} historical messages. Ready.")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+    def run(self, interval_sec: int = 10):
+        """Starts the infinite polling loop."""
+        log.info(f"🚀 Started Auto Booking Agent (Polling every {interval_sec}s)...")
+        while True:
+            try:
+                self._tick()
+            except Exception as e:
+                log.error(f"Tick error: {e}")
+            time.sleep(interval_sec)
 
-def _fmt_dt(date: str, time: str) -> str:
-    dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
-    return dt.strftime("%A, %d/%m/%Y lúc %H:%M").capitalize()
+    def _tick(self):
+        """One cycle of syncing and processing."""
+        self.sync.sync_all_recent(count=10)
+        
+        params = api.build_get_list_recent_chat_params(offset=0, count=10)
+        resp = self.sync._client.get(api.Endpoint.GET_LIST_RECENT_CHAT, params=params).json()
+        
+        for convo in api.unwrap_list(resp, "list_recent_chat"):
+            parsed = api.parse_message(convo, self.sync._oa_id)
+            user_id = parsed.from_id if parsed.src == api.MessageSrc.CLIENT else parsed.to_id
+            
+            if not user_id: 
+                continue
+            
+            history = self.store.get_history(user_id, last_n=5)
+            for msg in reversed(history):
+                if msg.sender_role == "user" and msg.msg_id not in self.processed_msgs:
+                    self.processed_msgs.add(msg.msg_id)
+                    self._process_message(user_id, msg.text)
 
+    def _process_message(self, user_id: str, text: str):
+        """Evaluates a single new message and routes it through the LLM & Validator."""
+        log.info(f"📥 [New Message] from {user_id[:8]}... : {text}")
+        log.info(f"⚙️  [Processing] Analyzing intent for {user_id[:8]}...")
+        
+        # Abort/Skip command check
+        if text.strip().lower() in ("huỷ", "huy", "skip", "thoát"):
+            log.info(f"⚠️  [Aborted] User {user_id[:8]}... aborted booking.")
+            self._send_reply(user_id, "Đã huỷ tiến trình đặt lịch hiện tại. Bạn có thể bắt đầu lại bất cứ lúc nào.")
+            return
 
-def _print_banner():
-    print(f"\n{'═'*58}")
-    print("  🗓️   ZALO BOOKING AGENT  —  MVP")
-    print("  LLM : Groq / Llama-3.3-70B (free)  |  Store: JSON")
-    print(f"{'═'*58}")
-    print("  Gõ tin nhắn đặt lịch bằng tiếng Việt.")
-    print("  Gõ  'exit'  để thoát. Gõ  'skip'  để huỷ lịch đang đặt.\n")
+        active_booking = self.store.get_active_booking(user_id)
 
+        if active_booking:
+            synthetic_context = (
+                f"Đã biết -> Tên: {active_booking.name}, Dịch vụ: {active_booking.service}, "
+                f"Ngày: {active_booking.date}, Giờ: {active_booking.time}. "
+                f"Khách vừa nhắn thêm (cập nhật thông tin trên): '{text}'"
+            )
+            data = self.chain.extract(synthetic_context)
+            
+            patch = {
+                "name": data.name or active_booking.name,
+                "service": data.service or active_booking.service,
+                "date": data.date or active_booking.date,
+                "time": data.time or active_booking.time,
+                "phone": data.phone or active_booking.phone,
+                "confidence": data.confidence,         
+                "denial_reason": data.denial_reason   
+            }
+            self.store.update_active_booking(user_id, patch)
+            
+        else:
+            data = self.chain.extract(text)
+            if data.intent != BookingIntent.BOOKING:
+                log.info(f"⏭️  [Ignored] Message from {user_id[:8]}... is not a booking intent.")
+                return
+                
+            self.store.start_booking(user_id, data.intent)
+            patch = {
+                "name": data.name,
+                "service": data.service,
+                "date": data.date,
+                "time": data.time,
+                "phone": data.phone,
+                "confidence": data.confidence,          
+                "denial_reason": data.denial_reason   
+            }
+            self.store.update_active_booking(user_id, patch)
 
-def _print_extracted(data: BookingData):
-    print("\n🤖  Kết quả trích xuất:")
-    for k, v in {
-        "intent":     data.intent.value,
-        "name":       data.name,
-        "phone":      data.phone,
-        "service":    data.service,
-        "date":       data.date,
-        "time":       data.time,
-        "duration":   f"{data.duration_minutes} phút",
-        "notes":      data.notes,
-        "confidence": f"{data.confidence:.0%}",
-    }.items():
-        mark = " ⚠️" if v is None and k in REQUIRED else ""
-        print(f"   {k:<12}: {v}{mark}")
+        updated_active = self.store.get_active_booking(user_id)
+        is_valid, reason = self.validator.validate(updated_active)
+        
+        if is_valid:
+            self.store.confirm_active_booking(user_id)
+            self._send_success_reply(user_id, updated_active)
+        else:
+            log.info(f"🟡 [Incomplete] Missing info for {user_id[:8]}... requesting more data.")
+            self._send_reply(user_id, reason)
 
-
-def _missing_required(data: BookingData) -> list[str]:
-    return [f for f in REQUIRED if not getattr(data, f, None)]
-
-
-# ── Feedback loop ─────────────────────────────────────────────────────────────
-
-class _Skip(Exception):
-    """Raised when the user aborts mid-booking."""
-
-
-def _ask_field(field: str) -> str:
-    """Prompt for a single field. Raises _Skip if user wants to abort."""
-    label, hint, _ = FIELD_META[field]
-    try:
-        answer = input(f"   ✏️  {label} ({hint}): ").strip()
-    except (KeyboardInterrupt, EOFError):
-        raise _Skip
-
-    if answer.lower() in ("skip", "exit", "q", "thoát", "huỷ", "huy"):
-        raise _Skip
-    return answer
-
-
-def _merge_field(data: BookingData, field: str, raw_answer: str, chain) -> BookingData:
-    """
-    Merge one user answer into BookingData.
-    - date/time: re-parse with LLM (handles "thứ 6 tuần này" etc.)
-    - name/service/phone: set directly
-    """
-    _, _, needs_llm = FIELD_META[field]
-
-    if needs_llm:
-        synthetic = (
-            f"Tên: {data.name or 'N/A'}, "
-            f"dịch vụ: {data.service or 'N/A'}, "
-            f"{field}: {raw_answer}"
+    def _send_success_reply(self, user_id: str, booking: BookingData):
+        """Formats and sends the final confirmation receipt."""
+        dt_str = f"{booking.date} {booking.time}"
+        msg = (
+            f"✅ Đặt lịch thành công!\n"
+            f"👤 Khách hàng: {booking.name}\n"
+            f"💆 Dịch vụ: {booking.service}\n"
+            f"🕐 Thời gian: {dt_str} ({booking.duration_minutes} phút)\n\n"
+            f"Cảm ơn bạn đã đặt lịch!"
         )
+        self._send_reply(user_id, msg)
+
+    def _send_reply(self, user_id: str, text: str):
+        """Sends a message via the Zalo API and saves it to local history."""
+        log.info(f"📤 [Sending Reply] to {user_id[:8]}... : {text.replace(chr(10), ' ')}")
+        
+        url = api.Endpoint.POST_SEND_MESSAGE
+        payload = api.build_post_send_message_payload(user_id, text)
+        
         try:
-            parsed = chain.extract(synthetic)
-            value  = getattr(parsed, field)
-        except Exception:
-            value = None
+            resp = self.sync._client.post(url, json=payload)
+            resp.raise_for_status()
+            
+            self.store.append_message(
+                sender_id=self.store.oa_id,
+                recipient_id=user_id,
+                text=text,
+                sender_role="assistant",
+                recipient_role="user",
+                synced_from_api=False
+            )
+            log.info(f"✅ [Responded] Successfully sent message to {user_id[:8]}...")
+        except Exception as e:
+            log.error(f"❌ [Error] Failed to send Zalo message to {user_id}: {e}")
 
-        if not value:
-            print(f"   ⚠️  Không hiểu '{raw_answer}'. Thử lại (vd: 28/03/2026 hoặc 15:00).")
-            return data  # leave as None → loop will retry
-    else:
-        value = raw_answer or None
-
-    return dataclasses.replace(data, **{field: value})
-
-
-def collect_missing_fields(data: BookingData, chain) -> BookingData:
-    """
-    Ask for each missing required field interactively (up to MAX_RETRIES each).
-    Returns updated BookingData. Raises _Skip if user aborts or retries exhausted.
-    """
-    MAX_RETRIES = 3
-
-    for field in REQUIRED:
-        retries = 0
-        while not getattr(data, field, None):
-            if retries >= MAX_RETRIES:
-                print(f"   ❌  Đã thử {MAX_RETRIES} lần. Huỷ đặt lịch.")
-                raise _Skip
-            raw  = _ask_field(field)
-            data = _merge_field(data, field, raw, chain)
-            retries += 1
-
-    return data
-
-
-# ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    # Lazy import so test files can import this module without langchain installed
-    from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent.parent / ".env")
-    from services.llm_service import IntentExtractionChain
-
-    _print_banner()
-
-    print("🔧  Initialising…")
+    
+    db = Database()
+    store = ChatHistoryStore(db, oa_id=os.getenv("ZALOOA_ID"))
+    
+    sync_service = ZaloMessageSync(
+        access_token=os.getenv("ZALOOA_ACCESS_TOKEN"), 
+        history_store=store
+    )
+    chain = IntentExtractionChain()
+    validator = BookingValidator(store=store)
+    
+    agent = BookingAgent(store, sync_service, chain, validator)
+    
     try:
-        chain = IntentExtractionChain()
-        store = JsonStore()
-        
-        # CLEAR EXISTING DATA INSIDE BOOKINGS.JSON !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        JsonStore.clear(self=store)
-    except EnvironmentError as exc:
-        print(f"\n❌  Setup error:\n{exc}")
-        sys.exit(1)
-
-    print(f"✅  Ready. Bookings → {store.path}\n")
-
-    while True:
-        try:
-            user_msg = input("📨  Tin nhắn: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n👋  Tạm biệt!")
-            break
-
-        if not user_msg:
-            continue
-        if user_msg.lower() in ("exit", "quit", "thoát", "q"):
-            print("👋  Tạm biệt!")
-            break
-
-        print(f"\n{DIV}")
-        print("⏳  Đang phân tích…")
-
-        # Step 1 — LLM extraction
-        try:
-            data = chain.extract(user_msg)
-        except Exception as exc:
-            print(f"❌  DENIED — Lỗi LLM: {exc}\n")
-            continue
-
-        _print_extracted(data)
-
-        # Step 2 — Non-booking intent → deny immediately
-        if data.intent != BookingIntent.BOOKING:
-            reason = data.denial_reason or "Không phải yêu cầu đặt lịch."
-            print(f"\n❌  DENIED — {reason}\n")
-            continue
-
-        # Step 3 — Feedback loop for missing fields
-        missing = _missing_required(data)
-        if missing:
-            labels = [FIELD_META[f][0] for f in missing]
-            print(f"\n{DIV2}")
-            print(f"💬  Thiếu: {', '.join(labels)}.")
-            print(f"    Vui lòng bổ sung (gõ 'skip' để huỷ):")
-            print(DIV2)
-            try:
-                data = collect_missing_fields(data, chain)
-            except _Skip:
-                print("↩️   Đã huỷ. Vui lòng bắt đầu lại.\n")
-                continue
-
-            print(f"\n✔️   Đã bổ sung: {data.name} | {data.service} | {data.date} {data.time}")
-
-        # Step 4 — Validate (includes overlap check)
-        ok, reason = validate(data, store=store)
-        if not ok:
-            print(f"\n❌  DENIED — {reason}\n")
-            continue
-
-        # Step 5 — Write to JSON
-        record = store.add_booking(data)
-
-        print(f"\n✅  BOOKED  (id: {record['id']})")
-        print(f"   👤  {data.name}  ({data.phone or 'SĐT chưa có'})")
-        print(f"   💆  {data.service}")
-        print(f"   🕐  {_fmt_dt(data.date, data.time)}  ({data.duration_minutes} phút)")
-        if data.notes:
-            print(f"   📝  {data.notes}")
-        print(f"   💾  Saved → {store.path}\n")
-
-
-if __name__ == "__main__":
-    main()
+        agent.run(interval_sec=10)
+    except KeyboardInterrupt:
+        log.info("Shutting down cleanly...")
+    finally:
+        sync_service.close()

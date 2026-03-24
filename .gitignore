@@ -1,3 +1,14 @@
+# Tree
+repo-structure.txt
+
+# SQLite Databases
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Environment
 .env
 .env.*
