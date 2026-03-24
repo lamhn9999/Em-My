@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 STORE_PATH = Path(__file__).parent.parent / "store/bookings.json"
-
+STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 def _to_dt(date: str, time: str) -> datetime:
     return datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
 
