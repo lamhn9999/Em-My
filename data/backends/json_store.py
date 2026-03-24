@@ -57,11 +57,9 @@ class JsonStore:
     def add_booking(self, data) -> dict:
         """
         Append a confirmed booking.
-        Caller is responsible for running find_overlap() first.
         Returns the saved record.
         """
         records = self._load()
-
         record = {
             "id":               str(uuid.uuid4())[:8],
             "created_at":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -73,10 +71,27 @@ class JsonStore:
             "duration_minutes": data.duration_minutes,
             "notes":            data.notes,
         }
-
         records.append(record)
         self._save(records)
         return record
+
+    def update_booking(self, booking_id: str, updates: dict) -> bool:
+        """
+        Update an existing booking by ID. 
+        Returns True if found and updated, False otherwise.
+        """
+        records = self._load()
+        found = False
+        for rec in records:
+            if rec["id"] == booking_id:
+                for k, v in updates.items():
+                    if v is not None:
+                        rec[k] = v
+                found = True
+                break
+        if found:
+            self._save(records)
+        return found
 
     def all_bookings(self) -> list[dict]:
         return self._load()

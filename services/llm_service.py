@@ -50,38 +50,52 @@ def _build_llm():
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 
 _SYSTEM = dedent("""
-    Bạn là trợ lý đặt lịch thông minh cho spa/phòng khám/tư vấn.
+    Bạn là chuyên gia thiết kế System Prompt cho AI Agent đặt lịch (Zalo Booking Agent).
     Hôm nay là {today} (Asia/Ho_Chi_Minh).
 
-    Nhiệm vụ: Trích xuất thông tin đặt lịch từ tin nhắn tiếng Việt (kể cả viết tắt, không dấu).
+    Nhiệm vụ: Trích xuất thông tin đặt lịch từ tin nhắn khách hàng (spa/phòng khám: cắt tóc, triệt lông).
+    Hỗ trợ: Tiếng Việt (viết tắt, không dấu, sai chính tả).
 
-    Quy tắc chuyển đổi thời gian:
-    - "ngày mai"        → ngày hôm sau
-    - "tuần sau"        → +7 ngày, giữ thứ tương ứng
-    - "thứ X tuần này"  → ngày thứ X trong tuần hiện tại
-    - "sáng" (không giờ cụ thể) → 09:00
-    - "chiều"                    → 14:00
-    - "tối"                      → 18:00
-    - "3h chiều" / "15h" / "3pm" / "3h chiều nay" → 15:00  
+    =====================
+    🎯 QUY TẮC TRÍCH XUẤT
+    =====================
+    - intent: 'booking', 'cancel', 'query', 'unknown'.
+    - name, phone, service: trích xuất hoặc null.
+    - date: YYYY-MM-DD.
+    - time: HH:MM.
+    - duration_minutes: mặc định 60.
+    - confidence: 0.0 - 1.0 (0.9+ nếu đủ info cốt lõi).
+    - missing_fields: các trường còn thiếu (name, phone, service, date, time).
+    - follow_up_question: Câu hỏi phản hồi tự nhiên, thân thiện bằng tiếng Việt.
 
-    Quy tắc confidence:
-    - 0.9+ : đủ tất cả thông tin (tên, dịch vụ, ngày, giờ)
-    - 0.7–0.9 : có thể đặt nhưng thiếu vài chi tiết phụ
-    - < 0.7 : thiếu thông tin cốt lõi
+    =====================
+    🧾 QUY TẮC NOTES (RẤT QUAN TRỌNG)
+    =====================
+    1. LƯU VÀO NOTES: Triệu chứng, yêu cầu riêng (cắt ngắn, không hóa chất), mức độ chắc chắn.
+    2. KHÔNG LƯU VÀO NOTES: name, phone, service, date, time.
+    3. Gộp nhiều info phụ thành string ngắn gọn. Nếu không có -> null. KHÔNG tự bịa.
 
-    Trả về JSON hợp lệ (KHÔNG có markdown, KHÔNG có backtick) với cấu trúc:
+    =====================
+    🧠 THỜI GIAN & EDGE CASES
+    =====================
+    - Chuẩn hóa: "mai" -> ngày+1, "tuần sau" -> ngày+7, "chiều" -> 14:00.
+    - Multi-turn: Giữ lại thông tin từ context cũ nếu tin nhắn mới không ghi đè.
+    - Phủ định/Thay đổi: Xử lý linh hoạt khi user muốn huỷ hoặc đổi thông tin.
+
+    Trả về JSON duy nhất (KHÔNG markdown):
     {{
-      "intent": "booking" | "cancel" | "query" | "unknown",
-      "name": "<tên hoặc null>",
-      "phone": "<10 số hoặc null>",
-      "service": "<dịch vụ hoặc null>",
-      "date": "<YYYY-MM-DD hoặc null>",
-      "time": "<HH:MM hoặc null>",
-      "duration_minutes": <số nguyên, mặc định 60>,
-      "notes": "<ghi chú hoặc null>",
-      "confidence": <0.0 đến 1.0>,
-      "missing_fields": ["<tên trường còn thiếu>"],
-      "denial_reason": "<lý do nếu unknown, ngược lại null>"
+      "intent": "...",
+      "name": "...",
+      "phone": "...",
+      "service": "...",
+      "date": "...",
+      "time": "...",
+      "duration_minutes": 60,
+      "notes": "...",
+      "confidence": 0.0,
+      "missing_fields": [],
+      "denial_reason": null,
+      "follow_up_question": "..."
     }}
 """).strip()
 
@@ -93,8 +107,9 @@ _HUMAN = "Tin nhắn của khách: {message}"
 def _parse(raw: dict) -> BookingData:
     """Convert the raw JSON dict from the LLM into a BookingData dataclass."""
     try:
-        intent = BookingIntent(raw.get("intent", "unknown"))
-    except ValueError:
+        intent_val = raw.get("intent", "unknown")
+        intent = BookingIntent(intent_val)
+    except (ValueError, KeyError):
         intent = BookingIntent.UNKNOWN
 
     return BookingData(
@@ -109,6 +124,7 @@ def _parse(raw: dict) -> BookingData:
         confidence=float(raw.get("confidence") or 0.0),
         missing_fields=raw.get("missing_fields") or [],
         denial_reason=raw.get("denial_reason"),
+        follow_up_question=raw.get("follow_up_question"),
     )
 
 
@@ -126,7 +142,18 @@ class IntentExtractionChain:
         )
         self._chain  = self._prompt | self._llm | JsonOutputParser()
 
-    def extract(self, message: str) -> BookingData:
+    def extract(self, message: str, context: str = "") -> BookingData:
         today  = datetime.now().strftime("%A, %d/%m/%Y")
-        raw    = self._chain.invoke({"message": message, "today": today})
-        return _parse(raw)
+        inputs = {"message": message, "today": today}
+        if context:
+            # Inject context into the user message for multi-turn support
+            inputs["message"] = f"Context: {context}\n\nTin nhắn mới: {message}"
+
+        try:
+            raw = self._chain.invoke(inputs)
+            if not isinstance(raw, dict):
+                raise ValueError("LLM returned non-dict output")
+            return _parse(raw)
+        except Exception as exc:
+            print(f"⚠️  Extraction error: {exc}")
+            return BookingData(intent=BookingIntent.UNKNOWN, confidence=0.0)
