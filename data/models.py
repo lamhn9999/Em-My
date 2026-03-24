@@ -27,3 +27,4 @@ class BookingData:
     confidence:       float          = 0.0
     missing_fields:   list[str]      = field(default_factory=list)
     denial_reason:    Optional[str]  = None
+    follow_up_question: Optional[str] = None
