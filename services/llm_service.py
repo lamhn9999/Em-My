@@ -16,7 +16,7 @@ import os
 from datetime import datetime
 from textwrap import dedent
 
-from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from data.models import BookingData, BookingIntent
@@ -49,12 +49,13 @@ def _build_llm():
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 
-_SYSTEM = dedent("""
+_THINK_SYSTEM = dedent("""
     Bạn là trợ lý đặt lịch thông minh cho spa/phòng khám/tư vấn.
     Hôm nay là {today} (Asia/Ho_Chi_Minh).
 
-    Nhiệm vụ: Trích xuất thông tin đặt lịch từ tin nhắn tiếng Việt (kể cả viết tắt, không dấu).
-
+    Dựa vào Lịch sử chat (tin nhắn mới nhất nằm cuối), hãy suy nghĩ và phân tích xem khách hàng đang muốn làm gì trong tin nhắn mới nhất.
+    Nếu họ đang trả lời một câu hỏi của bạn (ví dụ: bổ sung ngày/giờ cho câu hỏi 'Bạn muốn đặt ngày nào?'), hãy hiểu ngữ cảnh để nhận diện đây là hành động bổ sung thông tin đặt lịch, chứ không phải là một câu hỏi trống không.
+    
     Quy tắc chuyển đổi thời gian:
     - "ngày mai"        → ngày hôm sau
     - "tuần sau"        → +7 ngày, giữ thứ tương ứng
@@ -64,28 +65,36 @@ _SYSTEM = dedent("""
     - "tối"                      → 18:00
     - "3h chiều" / "15h" / "3pm" / "3h chiều nay" → 15:00  
 
+    Hãy viết ra suy nghĩ của bạn về: intent của họ, họ muốn hỏi gì, và các trường (name, phone, service, date, time) được suy luận từ ngữ cảnh đoạn chat.
+""").strip()
+
+_JSON_SYSTEM = dedent("""
+    Dựa vào Lịch sử chat và Phân tích trước đó, hãy trích xuất thông tin thành JSON.
+    BẮT BUỘC: Bạn phải cố gắng tìm và trích xuất 5 trường quan trọng nhất: name, phone, service, date, time.
+
     Quy tắc confidence:
     - 0.9+ : đủ tất cả thông tin (tên, dịch vụ, ngày, giờ)
     - 0.7–0.9 : có thể đặt nhưng thiếu vài chi tiết phụ
     - < 0.7 : thiếu thông tin cốt lõi
 
-    Trả về JSON hợp lệ (KHÔNG có markdown, KHÔNG có backtick) với cấu trúc:
+    Trả về JSON hợp lệ (KHÔNG có markdown, KHÔNG có backtick, KHÔNG bọc trong markdown) với cấu trúc:
     {{
       "intent": "booking" | "cancel" | "query" | "unknown",
-      "name": "<tên hoặc null>",
-      "phone": "<10 số hoặc null>",
-      "service": "<dịch vụ hoặc null>",
-      "date": "<YYYY-MM-DD hoặc null>",
-      "time": "<HH:MM hoặc null>",
+      "query_type": "empty_schedule" | "upcoming_schedule" | "missing_fields" | null,
+      "name": "<tên (BẮT BUỘC tìm) hoặc null>",
+      "phone": "<10 số (BẮT BUỘC tìm) hoặc null>",
+      "service": "<dịch vụ (BẮT BUỘC tìm) hoặc null>",
+      "date": "<YYYY-MM-DD (BẮT BUỘC tìm) hoặc null>",
+      "time": "<HH:MM (BẮT BUỘC tìm) hoặc null>",
       "duration_minutes": <số nguyên, mặc định 60>,
       "notes": "<ghi chú hoặc null>",
       "confidence": <0.0 đến 1.0>,
-      "missing_fields": ["<tên trường còn thiếu>"],
       "denial_reason": "<lý do nếu unknown, ngược lại null>"
     }}
 """).strip()
 
-_HUMAN = "Tin nhắn của khách: {message}"
+_HUMAN_THINK = "Lịch sử chat:\n{history}"
+_HUMAN_JSON = "Lịch sử chat:\n{history}\n\nPhân tích của bạn:\n{thought}"
 
 
 # ── Parser: JSON → BookingData dataclass ───────────────────────────────────────
@@ -107,7 +116,7 @@ def _parse(raw: dict) -> BookingData:
         duration_minutes=int(raw.get("duration_minutes") or 60),
         notes=raw.get("notes"),
         confidence=float(raw.get("confidence") or 0.0),
-        missing_fields=raw.get("missing_fields") or [],
+        query_type=raw.get("query_type"),
         denial_reason=raw.get("denial_reason"),
     )
 
@@ -116,17 +125,33 @@ def _parse(raw: dict) -> BookingData:
 
 class IntentExtractionChain:
     """
-    LCEL chain:  prompt | llm | JsonOutputParser | _parse → BookingData
+    LCEL 2-step chain: 
+      1. history -> LLM -> thought (StrOutputParser)
+      2. history + thought -> LLM -> JSON (JsonOutputParser)
     """
 
     def __init__(self):
-        self._llm    = _build_llm()
-        self._prompt = ChatPromptTemplate.from_messages(
-            [("system", _SYSTEM), ("human", _HUMAN)]
-        )
-        self._chain  = self._prompt | self._llm | JsonOutputParser()
+        self._llm = _build_llm()
+        
+        self._think_chain = ChatPromptTemplate.from_messages([
+            ("system", _THINK_SYSTEM), 
+            ("human", _HUMAN_THINK)
+        ]) | self._llm | StrOutputParser()
+        
+        self._json_chain = ChatPromptTemplate.from_messages([
+            ("system", _JSON_SYSTEM), 
+            ("human", _HUMAN_JSON)
+        ]) | self._llm | JsonOutputParser()
 
-    def extract(self, message: str) -> BookingData:
-        today  = datetime.now().strftime("%A, %d/%m/%Y")
-        raw    = self._chain.invoke({"message": message, "today": today})
+    def extract(self, history_text: str) -> BookingData:
+        today = datetime.now().strftime("%A, %d/%m/%Y")
+        
+        print("\n[LLM] 🤔 Analyzing conversation history...")
+        thought = self._think_chain.invoke({"history": history_text, "today": today})
+        print(f"[LLM THOUGHT]:\n{thought}\n")
+        
+        print("[LLM] 📝 Extracting structured JSON...")
+        raw = self._json_chain.invoke({"history": history_text, "today": today, "thought": thought})
+        print(f"[LLM RAW PARSED]: {raw}\n")
+        
         return _parse(raw)

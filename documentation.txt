@@ -1,0 +1,45 @@
+Em-My Repository - Module Documentation and Internal Architecture
+
+1. Overview
+The Em-My application is an automated, stateful Zalo Official Account (OA) booking agent. It polls the Zalo API for new user messages, extracts booking intents and query contexts from Vietnamese texts using a 2-Step Large Language Model (LLM) pipeline, validates the parsed data against business rules, manages the chat and booking state in a local SQLite database, and replies to the user via Zalo.
+
+2. Application Structure
+The codebase follows a modular design divided into `core`, `services`, and `data` layers, orchestrated by `main.py`.
+
+3. Module Descriptions and Interactions
+
+3.1 Entry Point
+- main.py: The entry script that initializes the dependent services (Database, ChatHistoryStore, ZaloMessageSync, IntentExtractionChain, BookingValidator) and injects them into the `BookingAgent`, starting the main polling loop.
+
+3.2 Core Modules (`core/`)
+Contains the application's main business logic and orchestration.
+- core/booking_agent.py (BookingAgent): The central coordinator. It runs a background polling loop using `ZaloMessageSync` to fetch new messages. It reconstructs a readable chat history script via `ChatHistoryStore`, routes the full script to the `IntentExtractionChain` (LLM) for 2-step reasoning, updates the booking state with extracted entities, securely evaluates queries (`empty_schedule`, `upcoming_schedule`, `missing_fields`), processes cancellations securely via global `is_upcoming()` rules, runs `BookingValidator` over active flows, and formats text responses for transmission via Zalo bounds.
+- core/validator.py (BookingValidator): Applies business rules on the parsed `BookingData`. Checks include confidence thresholds, missing required fields, phone number validity (via `phone.py`), ensuring booking time is in the future, and preventing overlaps (via the DB).
+- core/phone.py: Contains utility logic to parse, normalize, and validate Vietnamese mobile network prefixes and formats.
+
+3.3 Services Layer (`services/`)
+Handles interactions with external systems (LLM, Zalo API) and the database persistence interface.
+- services/llm_service.py (IntentExtractionChain): Wraps LangChain and LLM interactions. It leverages a rigorous 2-step LCEL parsing process: Step 1 initiates a semantic 'Chain of Thought' analysis block evaluating the raw chronological chat history, while Step 2 bridges that thought into a rigidly mapped `BookingData` JSON structure. Effectively solves conversational amnesia.
+- services/zalo_api.py: The single source of truth for Zalo API contracts. It defines endpoints, payload builders, and parsers (mapping raw Zalo JSON to the `ParsedMessage` dataclass). It contains no network logic, acting purely as a data-shaping layer.
+- services/zalo_message_sync.py (ZaloMessageSync): Handles actual HTTP network calls to Zalo API. It uses `zalo_api.py` to build requests/parse responses and persists new messages/users directly into `ChatHistoryStore`. Called periodically by `BookingAgent`.
+- services/chat_history_store.py (ChatHistoryStore): The abstraction layer over the SQLite database. It manages user profiles, persists chat histories (both inbound from Zalo and outbound system replies), formats chat history for the LLM context, and encapsulates complex operations for schedule querying, safely cancelling historical constraints, and merging booking patches seamlessly. Given to `BookingAgent` and `ZaloMessageSync`. Operations are fully asynchronous.
+
+3.4 Data Layer (`data/`)
+Contains domain entities and data persistence implementations.
+- data/models.py: Defines shared dataclasses and Enums (`BookingData`, `Profile`, `Message`, `BookingIntent`, `BookingStatus`). Exposes the `is_upcoming()` method to actively compare schedule viability against instantaneous server time (Asia/Ho_Chi_Minh). Enforces deep type contracts like `query_type` resolution mapping.
+- data/backends/sqlite.py (Database): Contains all raw SQL operations and schema definitions (DDL). It creates tables for profiles, messages, and bookings, and exposes tightly-scoped asynchronous Python methods (via `aiosqlite`) with explicit async transaction support, enforcing constraints like skipping historically canceled states.
+
+3.5 Configuration (`config/`)
+- config/business.py: Placeholder for future configuration settings.
+
+4. Data Flow lifecycle for a Message
+1. ZaloMessageSync polls the Zalo API for unread iterations.
+2. Zalo_api parses the raw incoming Zalo JSON into ParsedMessage models.
+3. ZaloMessageSync saves them to the SQLite database via ChatHistoryStore.
+4. BookingAgent fetches the full chronological raw dialogue script (up to 8 interactions) from ChatHistoryStore for the specific client.
+5. BookingAgent passes the dialogue script into the LLMService (IntentExtractionChain).
+6. LLMService engages a 2-Step LCEL chain, reasoning the contextual flow internally `<thought>` before forcefully structuring out a `BookingData` payload possessing a derived intent, query type, and parameter extraction bindings.
+7. BookingAgent seamlessly acts upon the payload's intent: intercepting and fielding custom user queries on availability or executing a timezone-safe session cancellation. If routing to an active booking, it transparently patches the delta changes securely without losing conversational state.
+8. BookingAgent passes the active BookingData to BookingValidator.
+9. If valid, ChatHistoryStore commits the booking as CONFIRMED.
+10. BookingAgent formats a text response and sends it back to the user via Zalo API, simultaneously saving the system reply strictly into the ChatHistoryStore to close the loop on conversational context.

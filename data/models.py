@@ -4,7 +4,7 @@ models.py — Shared dataclass schemas (no external deps)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Optional, List
 
@@ -65,7 +65,7 @@ class BookingData:
     duration_minutes: int           = 60
     notes:            Optional[str] = None
     confidence:       float         = field(default=0.0)
-    missing_fields:   List[str] = field(default_factory=list)
+    query_type:       Optional[str] = None
     denial_reason:    Optional[str] = None
     # ── lifecycle ─────────────────────────────────────
     status:     BookingStatus = BookingStatus.PENDING
@@ -74,15 +74,19 @@ class BookingData:
     def is_complete(self) -> bool:
         return all([self.name, self.phone, self.service, self.date, self.time])
 
+    def is_upcoming(self) -> bool:
+        if not self.date or not self.time:
+            return False
+            
+        vn_tz = timezone(timedelta(hours=7))
+        now = datetime.now(vn_tz)
+        today_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M")
+        
+        if self.date > today_str:
+            return True
+        if self.date == today_str and self.time >= time_str:
+            return True
+            
+        return False
 
-@dataclass
-class ExtractionResult:
-    """
-    Transient output from the LLM extraction step.
-    Never written to the DB directly.
-    """
-    intent:         BookingIntent
-    extracted:      BookingData
-    confidence:     float      = 0.0
-    missing_fields: list[str]  = field(default_factory=list)
-    denial_reason:  Optional[str] = None

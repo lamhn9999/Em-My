@@ -28,7 +28,7 @@ class BookingValidator:
             "phone": "số điện thoại",
         }
 
-    def validate(self, data: BookingData) -> tuple[bool, str]:
+    async def validate(self, data: BookingData) -> tuple[bool, str]:
         """
         Apply booking rules in order.
         Returns: (is_valid: bool, reason_str: str)
@@ -67,10 +67,10 @@ class BookingValidator:
 
         # 6. Overlap Check (Requires store implementation)
         if self.store and hasattr(self.store, "find_overlap"):
-            conflict = self.store.find_overlap(data.date, data.time, data.duration_minutes)
+            conflict = await self.store.find_overlap(data.date, data.time, data.duration_minutes)
             if conflict:
                 return False, (
-                    f"Trùng lịch với khách khác"
+                    f"Trùng lịch với khách khác "
                     f"({conflict.get('date')} {conflict.get('time')})."
                 )
 
