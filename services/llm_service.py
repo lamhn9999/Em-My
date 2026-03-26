@@ -70,7 +70,11 @@ _THINK_SYSTEM = dedent("""
 
 _JSON_SYSTEM = dedent("""
     Dựa vào Lịch sử chat và Phân tích trước đó, hãy trích xuất thông tin thành JSON.
+    Hôm nay là {today} (Asia/Ho_Chi_Minh).
     BẮT BUỘC: Bạn phải cố gắng tìm và trích xuất 5 trường quan trọng nhất: name, phone, service, date, time.
+    
+    LƯU Ý QUAN TRỌNG VỀ NGÀY THÁNG:
+    Ngày (date) xuất ra định dạng YYYY-MM-DD BẮT BUỘC phải khớp chính xác với ngày đã được phân tích và suy luận trong Phân tích của bạn. Tuyệt đối không tự cộng trừ thêm ngày.
 
     Quy tắc confidence:
     - 0.9+ : đủ tất cả thông tin (tên, dịch vụ, ngày, giờ)
