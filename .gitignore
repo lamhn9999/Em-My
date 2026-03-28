@@ -1,5 +1,10 @@
 # Tree
 repo-structure.txt
+.claude
+
+# MD
+TrolyNhan_Daquytrinh_Prompt.md
+data/reports/*
 
 # SQLite Databases
 *.sqlite
@@ -58,3 +63,6 @@ htmlcov/
 # mypy / ruff
 .mypy_cache/
 .ruff_cache/
+
+# Zalo
+static/*

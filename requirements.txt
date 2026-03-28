@@ -1,5 +1,8 @@
 # Core LangChain
 langchain>=0.3.0
+
+# Ngrok tunnel (for local development)
+ngrok>=0.0.0
 langchain-core>=0.3.0
 
 # Free LLM providers (choose one or both)
@@ -21,3 +24,6 @@ httpx>=0.25.0
 
 # Flask
 Flask>=3.1.3
+
+# Scheduling optimisation (Flexible Job Shop / CP-SAT)
+ortools>=9.8

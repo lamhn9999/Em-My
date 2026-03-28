@@ -136,12 +136,22 @@ class ChatHistoryStore:
         booking = await self._db.get_active_booking(client_id)
         if booking is None:
             return None
-            
-        # Create a new instance with updated fields
+
+        raw_intent = patch.get("intent", booking.intent.value if booking.intent else "booking")
+        if isinstance(raw_intent, BookingIntent):
+            intent = raw_intent
+        else:
+            try:
+                intent = BookingIntent(raw_intent)
+            except ValueError:
+                intent = booking.intent
+
+        # Preserve new fields (steps_schedule, preferred_staff, etc.) from the
+        # existing booking so that partial patches never wipe them.
         updated = BookingData(
             booking_id=booking.booking_id,
             client_id=booking.client_id,
-            intent=BookingIntent(patch.get("intent", booking.intent.value)),
+            intent=intent,
             name=patch.get("name", booking.name),
             phone=patch.get("phone", booking.phone),
             service=patch.get("service", booking.service),
@@ -151,10 +161,15 @@ class ChatHistoryStore:
             notes=patch.get("notes", booking.notes),
             confidence=patch.get("confidence", booking.confidence),
             denial_reason=patch.get("denial_reason", booking.denial_reason),
+            preferred_staff=patch.get("preferred_staff", booking.preferred_staff),
+            message_type=patch.get("message_type", booking.message_type),
+            # Preserve scheduler output unless explicitly overridden
+            steps_schedule=patch.get("steps_schedule", booking.steps_schedule),
+            assigned_resources=patch.get("assigned_resources", booking.assigned_resources),
             status=booking.status,
             created_at=booking.created_at,
         )
-        
+
         async with self._db.transaction():
             await self._db.update_booking(updated)
         return updated
