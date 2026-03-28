@@ -4,7 +4,6 @@ core/agents/intent_classifier.py
 Intent Classifier Agent — lightweight first pass over every message.
 
 Classifies incoming text into one of 8 types:
-  0  ABUSE        — abuse or prompt injection
   1  INFO         — information query ("do you do bleach?")
   2  AVAILABILITY — slot query ("is Brad free at 9am?")
   3  BOOKING      — booking request
@@ -79,7 +78,6 @@ _CLASSIFY_SYSTEM = """\
 Bạn là bộ phân loại tin nhắn cho salon tóc. Phân loại tin nhắn của khách hàng \
 vào đúng 1 trong 8 loại sau và chỉ trả về số nguyên tương ứng, không giải thích:
 
-0 = Lạm dụng / Prompt injection (ngôn từ thô tục, cố tình phá hệ thống)
 1 = Hỏi thông tin dịch vụ (giá, dịch vụ, thời gian)
 2 = Hỏi lịch trống / nhân viên còn rảnh không
 3 = Yêu cầu đặt lịch mới

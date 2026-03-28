@@ -64,7 +64,7 @@ logging.basicConfig(
 log = logging.getLogger("BookingAgent")
 
 # How long to wait after the last message before flushing (seconds).
-DEBOUNCE_SEC = 10
+DEBOUNCE_SEC = 5
 
 
 class BookingAgent:
@@ -176,6 +176,8 @@ class BookingAgent:
         # ── 0. Confirmation gate ──────────────────────────────────────────────
         # If this user has a scheduled booking awaiting explicit confirmation,
         # intercept the reply before the classifier sees it.
+        log.info("0. Confirmation gate...")
+
         if user_id in self._awaiting_confirmation:
             norm = _strip_diacritics(text.strip().lower())
             _YES = {"xac nhan", "yes", "ok", "oke", "dong y", "co",
@@ -189,14 +191,14 @@ class BookingAgent:
                 self._awaiting_confirmation.pop(user_id, None)
                 await self._send_reply(user_id, "Đã huỷ đặt lịch. Bạn có thể đặt lại bất cứ lúc nào nhé!")
                 return
-            # Anything else while awaiting → re-show the confirmation prompt
-            _, pending_result = self._awaiting_confirmation[user_id]
-            active_bk = await self.store.get_active_booking(user_id)
-            if active_bk:
-                await self._send_reply(user_id, _confirmation_prompt(active_bk, pending_result))
+            # Anything else while awaiting → treat as a change request, re-run booking flow
+            self._awaiting_confirmation.pop(user_id, None)
+            await self._handle_booking(user_id, text)
             return
 
         # ── 0b. Abort shortcut ────────────────────────────────────────────────
+        log.info("0b. Abort shortcut...")
+
         if _strip_diacritics(text.strip().lower()) in ("huy", "skip", "thoat"):
             await self.store.cancel_active_booking(user_id)
             await self._send_reply(
@@ -208,6 +210,8 @@ class BookingAgent:
         # ── 0b. Negotiation alternative selection ─────────────────────────────
         # When the user has been presented a numbered list of alternatives,
         # a bare digit ("1", "2", "3"…) picks that option — no LLM needed.
+        log.info("0b. Negotiation alternative selection...")
+
         if user_id in self._pending_alternatives:
             stripped = text.strip()
             if re.match(r'^[1-6]$', stripped):
@@ -215,12 +219,16 @@ class BookingAgent:
                 return
 
         # ── 1. Safety check ───────────────────────────────────────────────────
+        log.info("1. Safety check...")
+
         is_safe, safety_reply = await self._safety.check(user_id, text)
         if not is_safe:
             await self._send_reply(user_id, safety_reply)
             return
 
         # ── 2. Intent classification ──────────────────────────────────────────
+        log.info("2. Intent classification...")
+
         msg_type = await self._classifier.classify(text)
         log.info("🏷️  [Intent] %s → %s", user_id[:8], msg_type.name)
 
@@ -637,7 +645,7 @@ async def bootstrap():
     validator = BookingValidator(store=store)
 
     # Specialized agents (share the DB; no separate processes needed)
-    safety       = SafetyAgent(db)
+    safety       = SafetyAgent(db, llm=chain.llm)
     classifier   = IntentClassifier(llm=chain.llm)
     support      = CustomerSupportAgent()
     availability = AvailabilityAgent(db)

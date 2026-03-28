@@ -66,3 +66,4 @@ htmlcov/
 
 # Zalo
 static/*
+docs/*
