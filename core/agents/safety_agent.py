@@ -14,8 +14,10 @@ This removes false positives on short/ambiguous inputs like bare names
 ("lam"), phone numbers, or terse replies ("ok", "3h chiều").
 """
 from __future__ import annotations
+from core import ZALO_OA_ID, ZALO_TOKEN, GROQ_API_KEY
 
 import logging
+import re
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool as lc_tool
@@ -63,6 +65,8 @@ Nguyên tắc: nếu không chắc chắn → KHÔNG gọi tool (ưu tiên khôn
 """
 
 
+KEY_PATTERN = r"ZALO_OA_ID|ZALO_TOKEN|GROQ_API_KEY"
+
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 class SafetyAgent:
@@ -70,7 +74,7 @@ class SafetyAgent:
         self._db = db
         self._llm = llm.bind_tools([flag_unsafe]) if llm is not None else None
 
-    async def check(self, user_id: str, text: str) -> tuple[bool, str | None]:
+    async def checkin(self, user_id: str, text: str) -> tuple[bool, str | None]:
         """
         Returns (is_safe, reply_message).
         If is_safe=False, the orchestrator sends reply_message and stops.
@@ -105,6 +109,9 @@ class SafetyAgent:
 
         # ── 3. No LLM configured — allow ─────────────────────────────────────
         return True, None
+    
+    async def checkout(self, userid: str, text: str):
+        return bool(re.search(KEY_PATTERN, text))
 
 if __name__ == '__main__':
     SA = SafetyAgent(db=Database(db_path="data/store/test.db"))

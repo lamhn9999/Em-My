@@ -221,7 +221,7 @@ class BookingAgent:
         # ── 1. Safety check ───────────────────────────────────────────────────
         log.info("1. Safety check...")
 
-        is_safe, safety_reply = await self._safety.check(user_id, text)
+        is_safe, safety_reply = await self._safety.checkin(user_id, text)
         if not is_safe:
             await self._send_reply(user_id, safety_reply)
             return
